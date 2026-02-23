@@ -56,6 +56,8 @@ class HdrSdrTrayApp:
     TRAY_HOVER_GRACE_SECONDS = 1.8
     TRAY_HOVER_RADIUS_PX = 72
     WHEEL_MISS_LOG_INTERVAL_SECONDS = 1.2
+    WHEEL_QUEUE_WARN_THRESHOLD = 120
+    WHEEL_DIAG_LOG_INTERVAL_SECONDS = 3.0
     LOG_FILENAME = "HDR-SDR-Brightness.log"
 
     def __init__(self) -> None:
@@ -96,8 +98,11 @@ class HdrSdrTrayApp:
         self._notify_event_count = 0
         self._notify_log_budget = 60
         self._tray_icon_rect_cache: tuple[int, int, int, int, float] | None = None
+        self._tray_uid_candidates: list[int] = []
+        self._tray_uid_preferred: int | None = None
         self._tray_hover_until = 0.0
         self._tray_last_anchor: tuple[int, int] | None = None
+        self._tray_bad_anchor_logged_at = 0.0
         self._tray_rect_fail_logged_at = 0.0
         self._wheel_hook_thread: threading.Thread | None = None
         self._wheel_hook_thread_id: int | None = None
@@ -106,6 +111,17 @@ class HdrSdrTrayApp:
         self._wheel_hook_events = 0
         self._wheel_hook_miss_count = 0
         self._wheel_hook_miss_logged_at = 0.0
+        self._wheel_dispatch_lock = threading.Lock()
+        self._wheel_delta_pending = 0
+        self._wheel_flush_scheduled = False
+        self._wheel_enqueued_count = 0
+        self._wheel_flushed_count = 0
+        self._wheel_diag_logged_at = 0.0
+        self._rawinput_device_type = None
+        self._rawinput_header_type = None
+        self._rawinput_type = None
+        self._notify_icon_identifier_type = None
+        self._init_win_struct_types()
 
         self.icon = pystray.Icon(
             "hdr_sdr_brightness",
@@ -113,11 +129,119 @@ class HdrSdrTrayApp:
             "HDR SDR Brightness",
             menu=self._build_menu(),
         )
+        self._init_tray_uid_candidates()
 
         self._apply_root_theme()
         self.root.after(500, self._initial_apply)
         self.root.after(60_000, self._schedule_tick)
+        if self.debug_enabled:
+            self.root.after(15_000, self._debug_mem_tick)
         self._setup_hotkey()
+
+    def _init_tray_uid_candidates(self) -> None:
+        # pystray win32 backend currently writes hID (not uID), which means the
+        # effective uID may be 0 in NOTIFYICONDATA on some versions.
+        cands: list[int] = [0]
+        try:
+            cands.append(ctypes.c_uint(id(self.icon)).value)
+        except Exception:
+            pass
+        seen = set()
+        self._tray_uid_candidates = []
+        for uid in cands:
+            if uid in seen:
+                continue
+            seen.add(uid)
+            self._tray_uid_candidates.append(uid)
+
+    def _init_win_struct_types(self) -> None:
+        if os.name != "nt":
+            return
+
+        class GUID(ctypes.Structure):
+            _fields_ = [
+                ("Data1", wintypes.DWORD),
+                ("Data2", ctypes.c_ushort),
+                ("Data3", ctypes.c_ushort),
+                ("Data4", ctypes.c_ubyte * 8),
+            ]
+
+        class NOTIFYICONIDENTIFIER(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.DWORD),
+                ("hWnd", wintypes.HWND),
+                ("uID", wintypes.UINT),
+                ("guidItem", GUID),
+            ]
+
+        class RAWINPUTDEVICE(ctypes.Structure):
+            _fields_ = [
+                ("usUsagePage", ctypes.c_ushort),
+                ("usUsage", ctypes.c_ushort),
+                ("dwFlags", ctypes.c_uint),
+                ("hwndTarget", wintypes.HWND),
+            ]
+
+        class RAWINPUTHEADER(ctypes.Structure):
+            _fields_ = [
+                ("dwType", wintypes.DWORD),
+                ("dwSize", wintypes.DWORD),
+                ("hDevice", wintypes.HANDLE),
+                ("wParam", wintypes.WPARAM),
+            ]
+
+        class RAWMOUSE_BUTTONS(ctypes.Structure):
+            _fields_ = [
+                ("usButtonFlags", ctypes.c_ushort),
+                ("usButtonData", ctypes.c_ushort),
+            ]
+
+        class RAWMOUSE_UNION(ctypes.Union):
+            _fields_ = [
+                ("ulButtons", wintypes.ULONG),
+                ("buttons", RAWMOUSE_BUTTONS),
+            ]
+
+        class RAWMOUSE(ctypes.Structure):
+            _anonymous_ = ("u",)
+            _fields_ = [
+                ("usFlags", ctypes.c_ushort),
+                ("u", RAWMOUSE_UNION),
+                ("ulRawButtons", wintypes.ULONG),
+                ("lLastX", ctypes.c_long),
+                ("lLastY", ctypes.c_long),
+                ("ulExtraInformation", wintypes.ULONG),
+            ]
+
+        class RAWINPUT_UNION(ctypes.Union):
+            _fields_ = [
+                ("mouse", RAWMOUSE),
+                ("_padding", ctypes.c_byte * 40),
+            ]
+
+        class RAWINPUT(ctypes.Structure):
+            _anonymous_ = ("data",)
+            _fields_ = [
+                ("header", RAWINPUTHEADER),
+                ("data", RAWINPUT_UNION),
+            ]
+
+        self._rawinput_device_type = RAWINPUTDEVICE
+        self._rawinput_header_type = RAWINPUTHEADER
+        self._rawinput_type = RAWINPUT
+        self._notify_icon_identifier_type = NOTIFYICONIDENTIFIER
+
+    def _debug_mem_tick(self) -> None:
+        if not self.debug_enabled:
+            return
+        self._log_info(
+            "mem-sample private_mb=%.1f wheel_enqueued=%s wheel_flushed=%s hook_events=%s",
+            self._get_private_mem_mb(),
+            self._wheel_enqueued_count,
+            self._wheel_flushed_count,
+            self._wheel_hook_events,
+        )
+        self.root.after(15_000, self._debug_mem_tick)
 
     def run(self) -> None:
         tray_thread = threading.Thread(target=self.icon.run, daemon=True, name="tray-thread")
@@ -319,6 +443,7 @@ class HdrSdrTrayApp:
             return
 
         self._log_info("wheel-setup tray-hwnd=%s", hwnd)
+        self._log_info("wheel-setup tray-uid-candidates=%s preferred=%s", self._tray_uid_candidates, self._tray_uid_preferred)
         self._install_tray_message_handlers()
         self._set_notify_icon_version()
         self._register_raw_mouse_input(hwnd)
@@ -375,7 +500,7 @@ class HdrSdrTrayApp:
                 raw_l,
             )
             if delta != 0:
-                self.root.after(0, lambda d=delta: self._on_tray_wheel(d))
+                self._enqueue_wheel_delta(delta, "notify")
             else:
                 self._log_warn("wheel-notify wheel-event delta-missing")
             return 0
@@ -405,11 +530,23 @@ class HdrSdrTrayApp:
         return 0
 
     def _mark_tray_hover(self, raw_wparam: int) -> None:
+        pt = wintypes.POINT()
+        if ctypes.windll.user32.GetCursorPos(ctypes.byref(pt)):
+            self._refresh_tray_hover(pt.x, pt.y)
+            return
         x = self._signed_word(raw_wparam & 0xFFFF)
         y = self._signed_word((raw_wparam >> 16) & 0xFFFF)
         self._refresh_tray_hover(x, y)
 
     def _refresh_tray_hover(self, x: int, y: int) -> None:
+        # Ignore invalid anchor injected by some shell callback paths.
+        if x == 0 and y == 0:
+            now = time.time()
+            if now - self._tray_bad_anchor_logged_at >= 2.0:
+                self._tray_bad_anchor_logged_at = now
+                self._log_warn("wheel-hover ignored-invalid-anchor x=0 y=0")
+            self._tray_hover_until = now + self.TRAY_HOVER_GRACE_SECONDS
+            return
         self._tray_last_anchor = (x, y)
         self._tray_hover_until = time.time() + self.TRAY_HOVER_GRACE_SECONDS
 
@@ -494,7 +631,7 @@ class HdrSdrTrayApp:
                                 hit,
                                 "rect" if hit_by_rect else "hover",
                             )
-                            self.root.after(0, lambda d=delta: self._on_tray_wheel(d))
+                            self._enqueue_wheel_delta(delta, "llhook")
                         else:
                             self._wheel_hook_miss_count += 1
                             now = time.time()
@@ -565,19 +702,16 @@ class HdrSdrTrayApp:
         self._wheel_hook_thread = None
 
     def _register_raw_mouse_input(self, hwnd) -> None:
-        class RAWINPUTDEVICE(ctypes.Structure):
-            _fields_ = [
-                ("usUsagePage", ctypes.c_ushort),
-                ("usUsage", ctypes.c_ushort),
-                ("dwFlags", ctypes.c_uint),
-                ("hwndTarget", wintypes.HWND),
-            ]
+        rawinput_device_type = self._rawinput_device_type
+        if rawinput_device_type is None:
+            self._log_error("wheel-rawinput register-skipped missing-rawinput-type")
+            return
 
-        rid = RAWINPUTDEVICE(0x01, 0x02, self.RIDEV_INPUTSINK, hwnd)
+        rid = rawinput_device_type(0x01, 0x02, self.RIDEV_INPUTSINK, hwnd)
         ok = ctypes.windll.user32.RegisterRawInputDevices(
             ctypes.byref(rid),
             1,
-            ctypes.sizeof(RAWINPUTDEVICE),
+            ctypes.sizeof(rawinput_device_type),
         )
         self._raw_input_registered = bool(ok)
         if ok:
@@ -589,71 +723,38 @@ class HdrSdrTrayApp:
     def _on_tray_raw_input(self, wparam, lparam):
         if not self._raw_input_registered:
             return 0
+        pt = wintypes.POINT()
+        if not ctypes.windll.user32.GetCursorPos(ctypes.byref(pt)):
+            return 0
+        hit = self._is_point_on_our_tray_icon(pt.x, pt.y) or self._is_tray_hover_recent(pt.x, pt.y)
+        if not hit:
+            return 0
+
         delta = self._extract_wheel_delta(lparam)
         if delta == 0:
             return 0
-        hit = self._is_cursor_on_our_tray_icon()
+
         self._log_info("wheel-rawinput delta=%s hit=%s", delta, hit)
         if not hit:
             return 0
         try:
-            pt = wintypes.POINT()
-            if ctypes.windll.user32.GetCursorPos(ctypes.byref(pt)):
-                self._refresh_tray_hover(pt.x, pt.y)
+            self._refresh_tray_hover(pt.x, pt.y)
         except Exception:
             pass
-        self.root.after(0, lambda d=delta: self._on_tray_wheel(d))
+        self._enqueue_wheel_delta(delta, "rawinput")
         return 0
 
     def _extract_wheel_delta(self, lparam) -> int:
-        class RAWINPUTHEADER(ctypes.Structure):
-            _fields_ = [
-                ("dwType", wintypes.DWORD),
-                ("dwSize", wintypes.DWORD),
-                ("hDevice", wintypes.HANDLE),
-                ("wParam", wintypes.WPARAM),
-            ]
-
-        class RAWMOUSE_BUTTONS(ctypes.Structure):
-            _fields_ = [
-                ("usButtonFlags", ctypes.c_ushort),
-                ("usButtonData", ctypes.c_ushort),
-            ]
-
-        class RAWMOUSE_UNION(ctypes.Union):
-            _fields_ = [
-                ("ulButtons", wintypes.ULONG),
-                ("buttons", RAWMOUSE_BUTTONS),
-            ]
-
-        class RAWMOUSE(ctypes.Structure):
-            _anonymous_ = ("u",)
-            _fields_ = [
-                ("usFlags", ctypes.c_ushort),
-                ("u", RAWMOUSE_UNION),
-                ("ulRawButtons", wintypes.ULONG),
-                ("lLastX", ctypes.c_long),
-                ("lLastY", ctypes.c_long),
-                ("ulExtraInformation", wintypes.ULONG),
-            ]
-
-        class RAWINPUT_UNION(ctypes.Union):
-            _fields_ = [
-                ("mouse", RAWMOUSE),
-                ("_padding", ctypes.c_byte * 40),
-            ]
-
-        class RAWINPUT(ctypes.Structure):
-            _anonymous_ = ("data",)
-            _fields_ = [
-                ("header", RAWINPUTHEADER),
-                ("data", RAWINPUT_UNION),
-            ]
+        rawinput_header_type = self._rawinput_header_type
+        rawinput_type = self._rawinput_type
+        if rawinput_header_type is None or rawinput_type is None:
+            return 0
 
         size = wintypes.UINT(0)
         user32 = ctypes.windll.user32
         hraw = ctypes.c_void_p(lparam)
-        if user32.GetRawInputData(hraw, self.RID_INPUT, None, ctypes.byref(size), ctypes.sizeof(RAWINPUTHEADER)) == 0xFFFFFFFF:
+        header_size = ctypes.sizeof(rawinput_header_type)
+        if user32.GetRawInputData(hraw, self.RID_INPUT, None, ctypes.byref(size), header_size) == 0xFFFFFFFF:
             return 0
         if size.value == 0:
             return 0
@@ -664,11 +765,11 @@ class HdrSdrTrayApp:
             self.RID_INPUT,
             buffer,
             ctypes.byref(size),
-            ctypes.sizeof(RAWINPUTHEADER),
+            header_size,
         ) == 0xFFFFFFFF:
             return 0
 
-        raw = ctypes.cast(buffer, ctypes.POINTER(RAWINPUT)).contents
+        raw = ctypes.cast(buffer, ctypes.POINTER(rawinput_type)).contents
         if raw.header.dwType != self.RIM_TYPEMOUSE:
             return 0
 
@@ -681,22 +782,6 @@ class HdrSdrTrayApp:
         return ctypes.c_short(value & 0xFFFF).value
 
     def _get_tray_icon_rect(self) -> tuple[int, int, int, int] | None:
-        class GUID(ctypes.Structure):
-            _fields_ = [
-                ("Data1", wintypes.DWORD),
-                ("Data2", ctypes.c_ushort),
-                ("Data3", ctypes.c_ushort),
-                ("Data4", ctypes.c_ubyte * 8),
-            ]
-
-        class NOTIFYICONIDENTIFIER(ctypes.Structure):
-            _fields_ = [
-                ("cbSize", wintypes.DWORD),
-                ("hWnd", wintypes.HWND),
-                ("uID", wintypes.UINT),
-                ("guidItem", GUID),
-            ]
-
         hwnd = getattr(self.icon, "_hwnd", None)
         if not hwnd:
             now = time.time()
@@ -714,19 +799,47 @@ class HdrSdrTrayApp:
             return None
 
         rect = wintypes.RECT()
-        nii = NOTIFYICONIDENTIFIER()
-        nii.cbSize = ctypes.sizeof(NOTIFYICONIDENTIFIER)
-        nii.hWnd = hwnd
-        nii.uID = ctypes.c_uint(id(self.icon)).value
-
-        hr = shell32.Shell_NotifyIconGetRect(ctypes.byref(nii), ctypes.byref(rect))
-        if hr != 0:
-            now = time.time()
-            if now - self._tray_rect_fail_logged_at >= 2.0:
-                self._tray_rect_fail_logged_at = now
-                self._log_warn("wheel-hit-test get-rect-failed hr=%s hwnd=%s uid=%s", hr, hwnd, nii.uID)
+        notify_icon_identifier_type = self._notify_icon_identifier_type
+        if notify_icon_identifier_type is None:
+            self._log_warn("wheel-hit-test missing-notify-icon-type")
             return None
-        return rect.left, rect.top, rect.right, rect.bottom
+
+        uid_list: list[int] = []
+        if self._tray_uid_preferred is not None:
+            uid_list.append(int(self._tray_uid_preferred))
+        uid_list.extend(self._tray_uid_candidates)
+
+        # Keep order, remove duplicates.
+        seen = set()
+        uid_try: list[int] = []
+        for uid in uid_list:
+            u = int(ctypes.c_uint(uid).value)
+            if u in seen:
+                continue
+            seen.add(u)
+            uid_try.append(u)
+
+        for uid in uid_try:
+            nii = notify_icon_identifier_type()
+            nii.cbSize = ctypes.sizeof(notify_icon_identifier_type)
+            nii.hWnd = hwnd
+            nii.uID = uid
+            hr = shell32.Shell_NotifyIconGetRect(ctypes.byref(nii), ctypes.byref(rect))
+            if hr == 0:
+                if self._tray_uid_preferred != uid:
+                    self._tray_uid_preferred = uid
+                    self._log_info("wheel-hit-test get-rect uid-selected uid=%s", uid)
+                return rect.left, rect.top, rect.right, rect.bottom
+
+        now = time.time()
+        if now - self._tray_rect_fail_logged_at >= 2.0:
+            self._tray_rect_fail_logged_at = now
+            self._log_warn(
+                "wheel-hit-test get-rect-failed hwnd=%s tried_uid=%s",
+                hwnd,
+                uid_try,
+            )
+        return None
 
     def _get_tray_icon_rect_cached(self) -> tuple[int, int, int, int] | None:
         now = time.time()
@@ -752,9 +865,81 @@ class HdrSdrTrayApp:
             return False
         return self._is_point_on_our_tray_icon(pt.x, pt.y)
 
+    def _enqueue_wheel_delta(self, delta: int, source: str) -> None:
+        if delta == 0:
+            return
+        should_schedule = False
+        pending_count = 0
+        with self._wheel_dispatch_lock:
+            self._wheel_delta_pending += int(delta)
+            self._wheel_enqueued_count += 1
+            if not self._wheel_flush_scheduled:
+                self._wheel_flush_scheduled = True
+                should_schedule = True
+            pending_count = self._wheel_enqueued_count - self._wheel_flushed_count
+
+        now = time.time()
+        if pending_count >= self.WHEEL_QUEUE_WARN_THRESHOLD and now - self._wheel_diag_logged_at >= self.WHEEL_DIAG_LOG_INTERVAL_SECONDS:
+            self._wheel_diag_logged_at = now
+            self._log_info(
+                "wheel-queue backlog pending=%s enqueued=%s flushed=%s source=%s private_mb=%.1f",
+                pending_count,
+                self._wheel_enqueued_count,
+                self._wheel_flushed_count,
+                source,
+                self._get_private_mem_mb(),
+            )
+
+        if should_schedule:
+            self.root.after(0, self._flush_wheel_delta)
+
+    def _flush_wheel_delta(self) -> None:
+        with self._wheel_dispatch_lock:
+            delta = self._wheel_delta_pending
+            self._wheel_delta_pending = 0
+            self._wheel_flushed_count = self._wheel_enqueued_count
+            self._wheel_flush_scheduled = False
+        if delta != 0:
+            self._on_tray_wheel(delta)
+
+    def _get_private_mem_mb(self) -> float:
+        if os.name != "nt":
+            return 0.0
+        try:
+            class PROCESS_MEMORY_COUNTERS_EX(ctypes.Structure):
+                _fields_ = [
+                    ("cb", wintypes.DWORD),
+                    ("PageFaultCount", wintypes.DWORD),
+                    ("PeakWorkingSetSize", ctypes.c_size_t),
+                    ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t),
+                    ("PeakPagefileUsage", ctypes.c_size_t),
+                    ("PrivateUsage", ctypes.c_size_t),
+                ]
+
+            counters = PROCESS_MEMORY_COUNTERS_EX()
+            counters.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS_EX)
+            ok = ctypes.windll.psapi.GetProcessMemoryInfo(
+                ctypes.windll.kernel32.GetCurrentProcess(),
+                ctypes.byref(counters),
+                counters.cb,
+            )
+            if ok:
+                return counters.PrivateUsage / (1024 * 1024)
+        except Exception:
+            pass
+        return 0.0
+
     def _on_tray_wheel(self, delta: int) -> None:
         old = self.settings.manual
-        step = 2 if delta > 0 else -2
+        notches = int(delta / 120) if abs(delta) >= 120 else (1 if delta > 0 else -1)
+        if notches == 0:
+            return
+        step = 2 * notches
         target = self._clamp(old + step, 0, 100)
         if target == old:
             self._log_info("wheel-apply skipped old=%s target=%s", old, target)

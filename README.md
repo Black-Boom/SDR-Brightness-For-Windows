@@ -68,5 +68,7 @@ Windows 11 快速设置面板当前没有稳定公开的第三方扩展接口，
   - `wheel-rawinput`
   - `wheel-llhook`
   - `wheel-llhook miss`
+  - `wheel-queue backlog`
+  - `mem-sample`
   - `wheel-hit-test`
   - `wheel-apply`
