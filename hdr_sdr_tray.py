@@ -1,6 +1,7 @@
 ﻿import configparser
 import ctypes
 import logging
+import math
 import os
 import shutil
 import subprocess
@@ -245,12 +246,24 @@ class HdrSdrTrayApp:
                 link_path.unlink()
 
     def _build_icon_image(self) -> Image.Image:
-        img = Image.new("RGBA", (64, 64), (20, 20, 20, 0))
+        img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
         d = ImageDraw.Draw(img)
-        d.rounded_rectangle((6, 10, 58, 54), radius=12, fill=(40, 120, 220, 255))
-        d.rectangle((16, 26, 48, 32), fill=(255, 255, 255, 255))
-        d.rectangle((20, 20, 44, 24), fill=(255, 255, 255, 255))
-        d.rectangle((20, 34, 44, 38), fill=(255, 255, 255, 255))
+
+        cx = 32
+        cy = 32
+        ray_inner = 17
+        ray_outer = 27
+        ray_color = (236, 173, 35, 255)
+        for i in range(8):
+            a = i * math.pi / 4.0
+            x1 = cx + math.cos(a) * ray_inner
+            y1 = cy + math.sin(a) * ray_inner
+            x2 = cx + math.cos(a) * ray_outer
+            y2 = cy + math.sin(a) * ray_outer
+            d.line((x1, y1, x2, y2), fill=ray_color, width=4)
+
+        d.ellipse((15, 15, 49, 49), fill=(249, 193, 47, 255))
+        d.ellipse((21, 21, 43, 43), fill=(255, 224, 120, 255))
         return img
 
     def _build_menu(self) -> pystray.Menu:
