@@ -11,6 +11,7 @@
 - 主题切换：右键菜单可选浅色或深色（Windows 11 风格）。
 - 窗口外点击自动关闭滑块窗口。
 - 使用 Windows 原生窗口属性 API（圆角/系统背景/深浅色提示）提升系统风格一致性。
+- 鼠标停留托盘图标时可滚轮调节亮度（优先托盘消息与 Raw Input，必要时启用仅滚轮的低级监听兜底，且不拦截系统事件）。
 
 ## 关于“音量下面的系统快速设置面板”
 Windows 11 快速设置面板当前没有稳定公开的第三方扩展接口，无法可靠把自定义滑块直接嵌入该面板。此项目采用托盘弹窗作为替代入口。
@@ -29,6 +30,8 @@ Windows 11 快速设置面板当前没有稳定公开的第三方扩展接口，
    `pip install -r requirements.txt`
 3. 启动：
    `python hdr_sdr_tray.py`
+4. 如需输出日志（调试模式）：
+   `python hdr_sdr_tray.py -debug`
 
 ## 打包单文件 EXE
 执行：
@@ -49,3 +52,19 @@ Windows 11 快速设置面板当前没有稳定公开的第三方扩展接口，
 - `DayStart` / `NightStart`: 时间（HH:MM）
 - `Enabled`: 自动调节开关（1/0）
 - `Theme`: 主题（`light` / `dark`）
+
+## 日志文件
+- 默认不输出日志文件。
+- 仅在使用 `-debug` 参数启动时输出日志：
+  - 开发态：`python hdr_sdr_tray.py -debug`
+  - 打包后：`HDR-SDR-Brightness.exe -debug`
+- 日志默认写到 `exe` 同级目录：`HDR-SDR-Brightness.log`
+- 如果 `exe` 同级目录不可写，会回退到：`%LOCALAPPDATA%\HDR-SDR-Brightness\HDR-SDR-Brightness.log`
+- 排查“托盘滚轮无效”时，请提供包含以下关键字的日志行：
+  - `wheel-setup`
+  - `wheel-notify raw`
+  - `wheel-rawinput`
+  - `wheel-llhook`
+  - `wheel-llhook miss`
+  - `wheel-hit-test`
+  - `wheel-apply`
