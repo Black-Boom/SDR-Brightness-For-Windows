@@ -80,9 +80,11 @@ class HdrSdrTrayApp:
         self.slider_var = tk.IntVar(value=self.settings.manual)
         self.hotkey_registered = False
         self.slider_canvas: tk.Canvas | None = None
-        self.slider_track_left = 18
-        self.slider_track_right = 318
-        self.slider_track_y = 18
+        self.slider_canvas_width = 176
+        self.slider_canvas_height = 22
+        self.slider_track_left = 7
+        self.slider_track_right = self.slider_canvas_width - 7
+        self.slider_track_y = self.slider_canvas_height // 2
         self.slider_dragging = False
         self.sun_icon: tk.Label | None = None
         self.slider_shown_at = 0.0
@@ -1019,15 +1021,22 @@ class HdrSdrTrayApp:
             self.slider_window.resizable(False, False)
             self.slider_window.overrideredirect(True)
 
-            frame = tk.Frame(self.slider_window, padx=12, pady=10, bg=p["panel"])
+            frame = tk.Frame(self.slider_window, padx=7, pady=6, bg=p["panel"])
             frame.pack(fill="both", expand=True)
 
             row = tk.Frame(frame, bg=p["panel"])
             row.pack(fill="x")
-            self.sun_icon = tk.Label(row, text="☀", font=("Segoe UI Symbol", 14), bg=p["panel"], fg=p["icon"])
-            self.sun_icon.pack(side="left", padx=(0, 10))
+            self.sun_icon = tk.Label(row, text="☀", font=("Segoe UI Symbol", 11), bg=p["panel"], fg=p["icon"])
+            self.sun_icon.pack(side="left", padx=(0, 6))
 
-            self.slider_canvas = tk.Canvas(row, width=336, height=36, bg=p["panel"], highlightthickness=0, bd=0)
+            self.slider_canvas = tk.Canvas(
+                row,
+                width=self.slider_canvas_width,
+                height=self.slider_canvas_height,
+                bg=p["panel"],
+                highlightthickness=0,
+                bd=0,
+            )
             self.slider_canvas.pack(side="left")
             self.slider_canvas.bind("<Button-1>", self._on_slider_press)
             self.slider_canvas.bind("<B1-Motion>", self._on_slider_drag)
@@ -1039,7 +1048,12 @@ class HdrSdrTrayApp:
 
         self.slider_var.set(self._clamp(self.settings.manual, 0, 100))
         self._apply_slider_theme()
-        self._position_window(self.slider_window, width=420, height=64)
+        self.slider_window.update_idletasks()
+        self._position_window(
+            self.slider_window,
+            width=self.slider_window.winfo_reqwidth(),
+            height=self.slider_window.winfo_reqheight(),
+        )
         self.slider_window.deiconify()
         self.slider_window.lift()
         self.slider_window.focus_force()
@@ -1076,8 +1090,49 @@ class HdrSdrTrayApp:
         return left <= x <= right and top <= y <= bottom
 
     def _position_window(self, win: tk.Toplevel, width: int, height: int) -> None:
-        x = max(0, win.winfo_screenwidth() - width - 30)
-        y = max(0, win.winfo_screenheight() - height - 90)
+        screen_w = win.winfo_screenwidth()
+        screen_h = win.winfo_screenheight()
+        outer_margin = 6
+        taskbar_gap = 2
+
+        # Prefer anchoring above our tray icon so popup visually sticks to taskbar.
+        rect = self._get_tray_icon_rect_cached()
+        if rect:
+            left, top, right, bottom = rect
+            x = right - width
+            if top >= screen_h // 2:
+                y = top - height - taskbar_gap
+            else:
+                y = bottom + taskbar_gap
+            x = max(outer_margin, min(x, screen_w - width - outer_margin))
+            y = max(outer_margin, min(y, screen_h - height - outer_margin))
+            win.geometry(f"{width}x{height}+{x}+{y}")
+            return
+
+        x = screen_w - width - 12
+        y = screen_h - height - 48
+        if os.name == "nt":
+            try:
+                work = wintypes.RECT()
+                ok = ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(work), 0)
+                if ok:
+                    # Bottom taskbar (typical): place just above it.
+                    if work.bottom < screen_h:
+                        y = work.bottom - height - taskbar_gap
+                    # Top taskbar.
+                    elif work.top > 0:
+                        y = work.top + taskbar_gap
+
+                    # Right or left taskbar docking.
+                    if work.right < screen_w:
+                        x = work.right - width - taskbar_gap
+                    elif work.left > 0:
+                        x = work.left + taskbar_gap
+            except Exception:
+                pass
+
+        x = max(outer_margin, min(x, screen_w - width - outer_margin))
+        y = max(outer_margin, min(y, screen_h - height - outer_margin))
         win.geometry(f"{width}x{height}+{x}+{y}")
 
     def _draw_slider_canvas(self) -> None:
@@ -1091,11 +1146,27 @@ class HdrSdrTrayApp:
         v = self._clamp(self.slider_var.get(), 0, 100)
         x = self._value_to_x(v)
         y = self.slider_track_y
-        c.create_line(self.slider_track_left, y, self.slider_track_right, y, width=4, fill=p["track_inactive"], capstyle=tk.ROUND)
-        c.create_line(self.slider_track_left, y, x, y, width=4, fill=p["track_active"], capstyle=tk.ROUND)
+        c.create_line(
+            self.slider_track_left,
+            y,
+            self.slider_track_right,
+            y,
+            width=3,
+            fill=p["track_inactive"],
+            capstyle=tk.ROUND,
+        )
+        c.create_line(
+            self.slider_track_left,
+            y,
+            x,
+            y,
+            width=3,
+            fill=p["track_active"],
+            capstyle=tk.ROUND,
+        )
 
-        r_outer = 10
-        r_inner = 6
+        r_outer = 7
+        r_inner = 4
         c.create_oval(x - r_outer, y - r_outer, x + r_outer, y + r_outer, fill=p["thumb_ring"], outline=p["thumb_ring"])
         c.create_oval(x - r_inner, y - r_inner, x + r_inner, y + r_inner, fill=p["thumb_fill"], outline=p["thumb_fill"])
 

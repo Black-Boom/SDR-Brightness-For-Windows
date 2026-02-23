@@ -1,9 +1,11 @@
 ﻿# HDR SDR Brightness (Standalone EXE)
 
+[English README](README_en.md)
+
 这是一个用于调节 Windows HDR 中“调节 SDR 内容亮度”的托盘工具。
 
 ## 功能
-- 托盘滑块：点击托盘图标可弹出亮度滑块（靠近右下角）。
+- 托盘滑块：点击托盘图标可弹出亮度滑块（贴近任务栏，紧凑布局）。
 - 自动时间调节：支持白天/夜间时间段自动切换亮度。
 - 全局快捷键：`Win+Alt+S` 可随时呼出滑块。
 - 手动优先：手动拖动滑块并松手后，会自动关闭“自动时间调节”，避免下一轮定时覆盖你的手动亮度。
@@ -22,7 +24,7 @@ Windows 11 快速设置面板当前没有稳定公开的第三方扩展接口，
 ## 组件集成方式
 程序依赖 `set_sdrwhite.exe` 来真正写入 SDR 白电平，支持两种方式：
 - 自动：首次应用亮度时若缺失，会弹窗提示自动从 GitHub 下载并安装到 `exe` 同级目录。
-- 手动：把 `set_sdrwhite.exe` 放到程序目录或 `tools` 子目录。
+- 手动：把 `set_sdrwhite.exe` 放到程序目录。
 
 ## 运行方式（开发态）
 1. 安装 Python 3.10+。
@@ -40,7 +42,7 @@ Windows 11 快速设置面板当前没有稳定公开的第三方扩展接口，
 输出：
 `dist\HDR-SDR-Brightness.exe`
 
-如果 `tools\set_sdrwhite.exe` 存在，打包时会自动内置进 exe。
+`set_sdrwhite.exe` 可以在运行时自动下载；如需随包分发，请将其放在主程序 exe 同级目录（例如 `dist\set_sdrwhite.exe`）。
 
 ## 配置文件位置
 程序会将配置写入：
